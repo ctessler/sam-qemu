@@ -87,6 +87,7 @@ typedef struct {
     uint64_t l1_dmisses;
     uint64_t l1_imisses;
     uint64_t l2_misses;
+    bool auto_hit;
 } InsnData;
 
 void (*update_hit)(Cache *cache, int set, int blk);
@@ -112,6 +113,11 @@ static uint64_t l1_dmisses;
 
 static uint64_t l2_mem_accesses;
 static uint64_t l2_misses;
+
+static uint64_t min_addr=0;
+static uint64_t max_addr=UINT64_MAX;
+
+static bool use_ignore=false;
 
 static int pow_of_two(int num)
 {
@@ -392,18 +398,33 @@ static void vcpu_mem_access(unsigned int vcpu_index, qemu_plugin_meminfo_t info,
     struct qemu_plugin_hwaddr *hwaddr;
     int cache_idx;
     InsnData *insn;
-    bool hit_in_l1;
+    bool hit_in_l1 = false;
 
     hwaddr = qemu_plugin_get_hwaddr(info, vaddr);
     if (hwaddr && qemu_plugin_hwaddr_is_io(hwaddr)) {
         return;
     }
 
+    if ((vaddr < min_addr) || (vaddr > max_addr)) {
+        /* Treating all accesses outside of the range as hits */
+        hit_in_l1 = true;
+        if (use_ignore) {
+            /*
+             * Treating all accesses outside of the range as not
+             * contributing
+             */
+            return;
+        }
+    }
+
     effective_addr = hwaddr ? qemu_plugin_hwaddr_phys_addr(hwaddr) : vaddr;
     cache_idx = vcpu_index % cores;
 
     g_mutex_lock(&l1_dcache_locks[cache_idx]);
-    hit_in_l1 = access_cache(l1_dcaches[cache_idx], effective_addr);
+    if (!hit_in_l1) {
+        /* Could be true from min_addr, max_addr */
+        hit_in_l1 = access_cache(l1_dcaches[cache_idx], effective_addr);
+    }
     if (!hit_in_l1) {
         insn = userdata;
         __atomic_fetch_add(&insn->l1_dmisses, 1, __ATOMIC_SEQ_CST);
@@ -430,17 +451,28 @@ static void vcpu_mem_access(unsigned int vcpu_index, qemu_plugin_meminfo_t info,
 static void vcpu_insn_exec(unsigned int vcpu_index, void *userdata)
 {
     uint64_t insn_addr;
-    InsnData *insn;
+    InsnData *insn = userdata;
     int cache_idx;
-    bool hit_in_l1;
+    bool hit_in_l1 = false;
 
-    insn_addr = ((InsnData *) userdata)->addr;
+    insn_addr = insn->addr;
+
+    if (insn->auto_hit) {
+        /* Treating all accesses outside of the range as hits */
+        hit_in_l1 = true;
+        if (use_ignore) {
+            /* Ignore this instruction's cache impact */
+            return;
+        }
+    }
 
     cache_idx = vcpu_index % cores;
     g_mutex_lock(&l1_icache_locks[cache_idx]);
-    hit_in_l1 = access_cache(l1_icaches[cache_idx], insn_addr);
     if (!hit_in_l1) {
-        insn = userdata;
+        /* Could be true from insn->auto_hit */
+        hit_in_l1 = access_cache(l1_icaches[cache_idx], insn_addr);
+    }
+    if (!hit_in_l1) {
         __atomic_fetch_add(&insn->l1_imisses, 1, __ATOMIC_SEQ_CST);
         l1_icaches[cache_idx]->misses++;
     }
@@ -454,7 +486,6 @@ static void vcpu_insn_exec(unsigned int vcpu_index, void *userdata)
 
     g_mutex_lock(&l2_ucache_locks[cache_idx]);
     if (!access_cache(l2_ucaches[cache_idx], insn_addr)) {
-        insn = userdata;
         __atomic_fetch_add(&insn->l2_misses, 1, __ATOMIC_SEQ_CST);
         l2_ucaches[cache_idx]->misses++;
     }
@@ -466,14 +497,14 @@ static void vcpu_tb_trans(qemu_plugin_id_t id, struct qemu_plugin_tb *tb)
 {
     size_t n_insns;
     size_t i;
+    uint64_t vaddr;
     InsnData *data;
 
     n_insns = qemu_plugin_tb_n_insns(tb);
     for (i = 0; i < n_insns; i++) {
         struct qemu_plugin_insn *insn = qemu_plugin_tb_get_insn(tb, i);
-        uint64_t effective_addr = sys ? (uintptr_t) qemu_plugin_insn_haddr(insn) :
-                                        qemu_plugin_insn_vaddr(insn);
-
+        vaddr = qemu_plugin_insn_vaddr(insn);
+        uint64_t effective_addr = sys ? (uintptr_t) qemu_plugin_insn_haddr(insn) : vaddr;
         /*
          * Instructions might get translated multiple times, we do not create
          * new entries for those instructions. Instead, we fetch the same
@@ -483,6 +514,11 @@ static void vcpu_tb_trans(qemu_plugin_id_t id, struct qemu_plugin_tb *tb)
         data = g_hash_table_lookup(miss_ht, &effective_addr);
         if (data == NULL) {
             data = g_new0(InsnData, 1);
+            data->auto_hit = false;
+            if ((vaddr < min_addr) || (vaddr > max_addr)) {
+                /* Treating all accesses outside of the range as hits */
+                data->auto_hit = true;
+            }
             data->disas_str = qemu_plugin_insn_disas(insn);
             data->symbol = qemu_plugin_insn_symbol(insn);
             data->addr = effective_addr;
@@ -808,6 +844,12 @@ int qemu_plugin_install(qemu_plugin_id_t id, const qemu_info_t *info,
                 fprintf(stderr, "invalid eviction policy: %s\n", opt);
                 return -1;
             }
+        } else if (g_strcmp0(tokens[0], "minaddr") == 0) {
+            min_addr=g_ascii_strtoll(tokens[1], NULL, 16);
+        } else if (g_strcmp0(tokens[0], "maxaddr") == 0) {
+            max_addr=g_ascii_strtoll(tokens[1], NULL, 16);
+        } else if (g_strcmp0(tokens[0], "ignore") == 0) {
+            use_ignore = true;
         } else {
             fprintf(stderr, "option parsing failed: %s\n", opt);
             return -1;
